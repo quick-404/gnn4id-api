@@ -8,6 +8,8 @@ from flask_cors import CORS
 from datetime import datetime
 import random
 import os
+import csv
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -29,8 +31,12 @@ stats = {
     'total': 0,
     'attacks': 0,
     'normal': 0,
-    'recent_alerts': []
+    'recent_alerts': [],
+    'uploaded_flows': []  # 存储上传的流量数据
 }
+
+# 存储的流量数据（用于展示）
+stored_flows = []
 
 
 def detect_attack(flow_data):
@@ -60,10 +66,32 @@ def health():
 @app.route('/api/stats')
 def get_stats():
     """获取统计信息"""
+    # 如果有上传数据，使用实际数据统计
+    if stored_flows:
+        total = len(stored_flows)
+        attacks = sum(1 for f in stored_flows if f.get('label', 0) > 0)
+        normal = total - attacks
+        return jsonify({
+            'total': total,
+            'attacks': attacks,
+            'normal': normal,
+            'totalFlows': total,
+            'attackFlows': attacks,
+            'normalFlows': normal,
+            'detectionRate': round(97.5, 1),  # 模拟准确率
+            'attackRate': round(attacks / max(total, 1) * 100, 1),
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    # 模拟数据统计
     return jsonify({
         'total': stats['total'],
         'attacks': stats['attacks'],
         'normal': stats['normal'],
+        'totalFlows': stats['total'],
+        'attackFlows': stats['attacks'],
+        'normalFlows': stats['normal'],
+        'detectionRate': round(97.5, 1),
         'attackRate': round(stats['attacks'] / max(stats['total'], 1) * 100, 1),
         'timestamp': datetime.now().isoformat()
     })
@@ -75,6 +103,22 @@ def get_traffic_list():
     page = int(request.args.get('page', 1))
     pageSize = int(request.args.get('pageSize', 20))
     
+    # 如果有上传的数据，返回真实数据
+    if stored_flows:
+        total = len(stored_flows)
+        start = (page - 1) * pageSize
+        end = start + pageSize
+        page_flows = stored_flows[start:end]
+        
+        return jsonify({
+            'list': page_flows,
+            'total': total,
+            'page': page,
+            'pageSize': pageSize,
+            'source': 'uploaded'
+        })
+    
+    # 否则返回模拟数据
     flows = []
     for i in range(pageSize):
         attack_type, confidence = detect_attack({})
@@ -105,8 +149,194 @@ def get_traffic_list():
         'list': flows,
         'total': stats['total'],
         'page': page,
-        'pageSize': pageSize
+        'pageSize': pageSize,
+        'source': 'simulated'
     })
+
+
+@app.route('/api/data/upload', methods=['POST'])
+def upload_data():
+    """上传CSV数据文件"""
+    try:
+        if 'file' not in request.files:
+            # 尝试接收JSON数据
+            data = request.get_json()
+            if not data or 'flows' not in data:
+                return jsonify({'success': False, 'error': '没有文件或数据'}), 400
+            
+            flows = process_flow_data(data['flows'])
+        else:
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'success': False, 'error': '文件名为空'}), 400
+            
+            # 读取文件内容
+            content = file.read().decode('utf-8')
+            
+            # 解析CSV
+            flows = parse_csv(content)
+        
+        if not flows:
+            return jsonify({'success': False, 'error': '没有有效数据'}), 400
+        
+        # 更新存储的数据
+        global stored_flows
+        stored_flows = flows
+        
+        # 更新统计数据
+        stats['total'] = len(flows)
+        stats['attacks'] = sum(1 for f in flows if f.get('label', 0) > 0)
+        stats['normal'] = stats['total'] - stats['attacks']
+        
+        return jsonify({
+            'success': True,
+            'message': f'成功导入 {len(flows)} 条流量记录',
+            'stats': {
+                'total': stats['total'],
+                'attacks': stats['attacks'],
+                'normal': stats['normal'],
+                'attackRate': round(stats['attacks'] / max(stats['total'], 1) * 100, 1)
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def parse_csv(content):
+    """解析CSV内容"""
+    flows = []
+    lines = content.strip().split('\n')
+    
+    if len(lines) < 2:
+        return flows
+    
+    # 解析表头
+    header = lines[0].lower()
+    
+    # 尝试不同的CSV格式
+    try:
+        reader = csv.DictReader(io.StringIO(content))
+        headers = reader.fieldnames
+        
+        for i, row in enumerate(reader):
+            flow = parse_flow_row(row, headers)
+            if flow:
+                flows.append(flow)
+    except:
+        # 简单解析
+        for i, line in enumerate(lines[1:100]):  # 最多100条
+            try:
+                parts = line.split(',')
+                if len(parts) >= 5:
+                    flow = {
+                        'id': i + 1,
+                        'src_ip': parts[0].strip() if len(parts) > 0 else '0.0.0.0',
+                        'dst_ip': parts[1].strip() if len(parts) > 1 else '0.0.0.0',
+                        'protocol': parts[2].strip().upper() if len(parts) > 2 else 'TCP',
+                        'src_port': int(parts[3].strip()) if len(parts) > 3 and parts[3].strip().isdigit() else 0,
+                        'dst_port': int(parts[4].strip()) if len(parts) > 4 and parts[4].strip().isdigit() else 0,
+                        'bytes': int(parts[5].strip()) if len(parts) > 5 and parts[5].strip().isdigit() else 0,
+                        'label': int(parts[-1].strip()) if parts[-1].strip().isdigit() else 0,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    # 添加攻击类型
+                    attack_type = flow['label']
+                    if attack_type in ATTACK_TYPES:
+                        flow['attack_type'] = ATTACK_TYPES[attack_type]['name']
+                        flow['level'] = ATTACK_TYPES[attack_type]['level']
+                    else:
+                        flow['attack_type'] = '正常流量'
+                        flow['level'] = 'none'
+                    
+                    flows.append(flow)
+            except:
+                continue
+    
+    return flows
+
+
+def parse_flow_row(row, headers):
+    """解析流量数据行"""
+    # 常见列名映射
+    src_ip_keys = ['srcip', 'source_ip', 'src_ip', 'source', 'ip_src', 'src']
+    dst_ip_keys = ['dstip', 'dest_ip', 'dst_ip', 'destination', 'ip_dst', 'dst']
+    proto_keys = ['protocol', 'proto']
+    sport_keys = ['sport', 'src_port', 'source_port', 'srcport']
+    dport_keys = ['dport', 'dst_port', 'dest_port', 'dstport']
+    bytes_keys = ['bytes', 'byte', 'length', 'size', 'totbytes']
+    label_keys = ['label', 'class', 'attack', 'type', 'result', 'label_1']
+    
+    def find_value(keys):
+        for key in keys:
+            for header in headers:
+                if key in header.lower():
+                    return row.get(header, '')
+        return ''
+    
+    src_ip = find_value(src_ip_keys)
+    dst_ip = find_value(dst_ip_keys)
+    
+    if not src_ip and not dst_ip:
+        return None
+    
+    protocol = find_value(proto_keys).upper()
+    if not protocol:
+        protocol = 'TCP'
+    
+    try:
+        src_port = int(find_value(sport_keys))
+    except:
+        src_port = 0
+    
+    try:
+        dst_port = int(find_value(dport_keys))
+    except:
+        dst_port = 0
+    
+    try:
+        bytes_val = int(find_value(bytes_keys))
+    except:
+        bytes_val = 0
+    
+    try:
+        label = int(find_value(label_keys))
+    except:
+        label = 0
+    
+    flow = {
+        'id': len(stored_flows) + len([]),
+        'src_ip': str(src_ip),
+        'dst_ip': str(dst_ip),
+        'protocol': protocol,
+        'src_port': src_port,
+        'dst_port': dst_port,
+        'bytes': bytes_val,
+        'packets': 1,
+        'label': label,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    # 添加攻击类型
+    if label in ATTACK_TYPES:
+        flow['attack_type'] = ATTACK_TYPES[label]['name']
+        flow['level'] = ATTACK_TYPES[label]['level']
+    else:
+        flow['attack_type'] = '正常流量'
+        flow['level'] = 'none'
+    
+    return flow
+
+
+def process_flow_data(flows_data):
+    """处理流量数据列表"""
+    flows = []
+    for i, row in enumerate(flows_data):
+        flow = parse_flow_row(row, row.keys())
+        if flow:
+            flow['id'] = i + 1
+            flows.append(flow)
+    return flows
 
 
 @app.route('/api/attack/list')

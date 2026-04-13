@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: gnn4id-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn api_simple:app -b 0.0.0.0:$PORT
+    plan: free
